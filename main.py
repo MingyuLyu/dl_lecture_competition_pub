@@ -13,11 +13,13 @@ from pathlib import Path
 from typing import Dict, Any
 import os
 import time
-
+from src.losses import *
+import torch.nn.functional as F
 
 class RepresentationType(Enum):
     VOXEL = auto()
     STEPAN = auto()
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -27,14 +29,18 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False
     np.random.seed(seed)
 
+
 def compute_epe_error(pred_flow: torch.Tensor, gt_flow: torch.Tensor):
     '''
     end-point-error (ground truthと予測値の二乗誤差)を計算
     pred_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 予測したオプティカルフローデータ
     gt_flow: torch.Tensor, Shape: torch.Size([B, 2, 480, 640]) => 正解のオプティカルフローデータ
     '''
+    print("Predicted flow shape:", pred_flow.shape)
+    print("Ground truth flow shape:", gt_flow.shape)
     epe = torch.mean(torch.mean(torch.norm(pred_flow - gt_flow, p=2, dim=1), dim=(1, 2)), dim=0)
     return epe
+
 
 def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     '''
@@ -43,6 +49,7 @@ def save_optical_flow_to_npy(flow: torch.Tensor, file_name: str):
     file_name: str => ファイル名
     '''
     np.save(f"{file_name}.npy", flow.cpu().numpy())
+
 
 @hydra.main(version_base=None, config_path="configs", config_name="base")
 def main(args: DictConfig):
@@ -70,7 +77,7 @@ def main(args: DictConfig):
             ├─zurich_city_11_b
             └─zurich_city_11_c
         '''
-    
+
     # ------------------
     #    Dataloader
     # ------------------
@@ -84,15 +91,15 @@ def main(args: DictConfig):
     test_set = loader.get_test_dataset()
     collate_fn = train_collate
     train_data = DataLoader(train_set,
-                                 batch_size=args.data_loader.train.batch_size,
-                                 shuffle=args.data_loader.train.shuffle,
-                                 collate_fn=collate_fn,
-                                 drop_last=False)
+                            batch_size=args.data_loader.train.batch_size,
+                            shuffle=args.data_loader.train.shuffle,
+                            collate_fn=collate_fn,
+                            drop_last=False)
     test_data = DataLoader(test_set,
-                                 batch_size=args.data_loader.test.batch_size,
-                                 shuffle=args.data_loader.test.shuffle,
-                                 collate_fn=collate_fn,
-                                 drop_last=False)
+                           batch_size=args.data_loader.test.batch_size,
+                           shuffle=args.data_loader.test.shuffle,
+                           collate_fn=collate_fn,
+                           drop_last=False)
 
     '''
     train data:
@@ -101,7 +108,7 @@ def main(args: DictConfig):
         Key: event_volume, Type: torch.Tensor, Shape: torch.Size([Batch, 4, 480, 640]) => イベントデータのバッチ
         Key: flow_gt, Type: torch.Tensor, Shape: torch.Size([Batch, 2, 480, 640]) => オプティカルフローデータのバッチ
         Key: flow_gt_valid_mask, Type: torch.Tensor, Shape: torch.Size([Batch, 1, 480, 640]) => オプティカルフローデータのvalid. ベースラインでは使わない
-    
+
     test data:
         Type of batch: Dict
         Key: seq_name, Type: list
@@ -115,32 +122,53 @@ def main(args: DictConfig):
     # ------------------
     #   optimizer
     # ------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate, weight_decay=args.train.weight_decay)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.train.initial_learning_rate,
+                                 weight_decay=args.train.weight_decay)
+    smoothness_weight = 0.5
+
+    def multi_scale_epe_loss(flow_dict, ground_truth_flow, device='cuda'):
+        scales = ['flow0', 'flow1', 'flow2', 'flow3']  # Keys in the flow_dict corresponding to different scales
+        weights = [0.05, 0.1, 0.2, 0.65]  # Weights for each scale, must sum to 1
+        total_loss = 0.0
+
+        for scale, weight in zip(scales, weights):
+            predicted_flow = flow_dict[scale].to(device)
+            # Downsample ground_truth_flow to match the predicted_flow size
+            downsampled_gt_flow = F.interpolate(ground_truth_flow, size=predicted_flow.shape[2:], mode='area')
+            # Compute EPE
+            epe = torch.norm(predicted_flow - downsampled_gt_flow, p=2, dim=1).mean()
+            # Weighted loss for the current scale
+            total_loss += weight * epe
+
+        return total_loss
+
     # ------------------
     #   Start training
     # ------------------
+    # ole_model_path = "checkpoints/model_20240716222408.pth"
+    # model.load_state_dict(torch.load(ole_model_path, map_location=device))
     model.train()
+    # Example usage in your training loop
     for epoch in range(args.train.epochs):
         total_loss = 0
-        print("on epoch: {}".format(epoch+1))
+        print("on epoch: {}".format(epoch + 1))
         for i, batch in enumerate(tqdm(train_data)):
-            batch: Dict[str, Any]
-            event_image = batch["event_volume"].to(device) # [B, 4, 480, 640]
-            ground_truth_flow = batch["flow_gt"].to(device) # [B, 2, 480, 640]
-            flow = model(event_image) # [B, 2, 480, 640]
-            loss: torch.Tensor = compute_epe_error(flow, ground_truth_flow)
+            event_image = batch["event_volume"].to(device)
+            ground_truth_flow = batch["flow_gt"].to(device)
+            flow_dict = model(event_image)
+            loss = multi_scale_epe_loss(flow_dict, ground_truth_flow, device)
             print(f"batch {i} loss: {loss.item()}")
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-        print(f'Epoch {epoch+1}, Loss: {total_loss / len(train_data)}')
+        print(f'Epoch {epoch + 1}, Loss: {total_loss / len(train_data)}')
 
     # Create the directory if it doesn't exist
     if not os.path.exists('checkpoints'):
         os.makedirs('checkpoints')
-    
+
     current_time = time.strftime("%Y%m%d%H%M%S")
     model_path = f"checkpoints/model_{current_time}.pth"
     torch.save(model.state_dict(), model_path)
@@ -149,6 +177,7 @@ def main(args: DictConfig):
     # ------------------
     #   Start predicting
     # ------------------
+    # model_path = "checkpoints/model_20240716161649.pth"
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     flow: torch.Tensor = torch.tensor([]).to(device)
@@ -157,7 +186,8 @@ def main(args: DictConfig):
         for batch in tqdm(test_data):
             batch: Dict[str, Any]
             event_image = batch["event_volume"].to(device)
-            batch_flow = model(event_image) # [1, 2, 480, 640]
+            flow_dict = model(event_image)  # [1, 2, 480, 640]
+            batch_flow = flow_dict["flow3"].to(device)
             flow = torch.cat((flow, batch_flow), dim=0)  # [N, 2, 480, 640]
         print("test done")
     # ------------------
@@ -165,6 +195,7 @@ def main(args: DictConfig):
     # ------------------
     file_name = "submission"
     save_optical_flow_to_npy(flow, file_name)
+
 
 if __name__ == "__main__":
     main()

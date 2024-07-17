@@ -9,6 +9,7 @@ from numba import jit
 import numpy as np
 import os
 import imageio
+
 imageio.plugins.freeimage.download()
 import imageio.v3 as iio
 import torch
@@ -17,8 +18,13 @@ from torchvision.transforms import RandomCrop
 from torchvision import transforms as tf
 from torch.utils.data import Dataset
 
-
 from src.utils import RepresentationType, VoxelGrid, flow_16bit_to_float
+
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
+
+
+
 
 VISU_INDEX = 1
 
@@ -108,8 +114,8 @@ class EventSlicer:
         window_end_ms:      conservative end time in milliseconds
         """
         assert ts_end_us > ts_start_us
-        window_start_ms = math.floor(ts_start_us/1000)
-        window_end_ms = math.ceil(ts_end_us/1000)
+        window_start_ms = math.floor(ts_start_us / 1000)
+        window_end_ms = math.ceil(ts_end_us / 1000)
         return window_start_ms, window_end_ms
 
     @staticmethod
@@ -175,7 +181,8 @@ class EventSlicer:
 
 
 class Sequence(Dataset):
-    def __init__(self, seq_path: Path, representation_type: RepresentationType, mode: str = 'test', delta_t_ms: int = 100,
+    def __init__(self, seq_path: Path, representation_type: RepresentationType, mode: str = 'test',
+                 delta_t_ms: int = 100,
                  num_bins: int = 4, transforms=[], name_idx=0, visualize=False, load_gt=False):
         assert num_bins >= 1
         assert delta_t_ms == 100
@@ -209,7 +216,7 @@ class Sequence(Dataset):
         self.name_idx = name_idx
         self.visualize_samples = visualize
         self.load_gt = load_gt
-        self.transforms = transforms
+
         if self.mode == "test":
             assert load_gt == False
             # Get Test Timestamp File
@@ -247,10 +254,9 @@ class Sequence(Dataset):
         self.width = 640
         self.num_bins = num_bins
 
-
         # Set event representation
         self.voxel_grid = VoxelGrid(
-                (self.num_bins, self.height, self.width), normalize=True)
+            (self.num_bins, self.height, self.width), normalize=True)
         self.delta_t_us = delta_t_ms * 1000
 
         # Left events only
@@ -267,7 +273,7 @@ class Sequence(Dataset):
 
     def events_to_voxel_grid(self, p, t, x, y, device: str = 'cpu'):
         t = (t - t[0]).astype('float32')
-        t = (t/t[-1])
+        t = (t / t[-1])
         x = x.astype('float32')
         y = y.astype('float32')
         pol = p.astype('float32')
@@ -286,7 +292,7 @@ class Sequence(Dataset):
     def get_disparity_map(filepath: Path):
         assert filepath.is_file()
         disp_16bit = cv2.imread(str(filepath), cv2.IMREAD_ANYDEPTH)
-        return disp_16bit.astype('float32')/256
+        return disp_16bit.astype('float32') / 256
 
     @staticmethod
     def load_flow(flowfile: Path):
@@ -315,7 +321,7 @@ class Sequence(Dataset):
         assert x.max() < self.width
         assert y.max() < self.height
         return rectify_map[y, x]
-    
+
     def get_data(self, index) -> Dict[str, any]:
         ts_start: int = self.timestamps_flow[index] - self.delta_t_us
         ts_end: int = self.timestamps_flow[index]
@@ -348,19 +354,45 @@ class Sequence(Dataset):
                 p, t, x_rect, y_rect)
             output['event_volume'] = event_representation
         output['name_map'] = self.name_idx
-        
+
         if self.load_gt:
             output['flow_gt'
-                ] = [torch.tensor(x) for x in self.load_flow(self.flow_png[index])]
+            ] = [torch.tensor(x) for x in self.load_flow(self.flow_png[index])]
 
             output['flow_gt'
-                ][0] = torch.moveaxis(output['flow_gt'][0], -1, 0)
+            ][0] = torch.moveaxis(output['flow_gt'][0], -1, 0)
             output['flow_gt'
-                ][1] = torch.unsqueeze(output['flow_gt'][1], 0)
+            ][1] = torch.unsqueeze(output['flow_gt'][1], 0)
         return output
 
     def __getitem__(self, idx):
         sample = self.get_data(idx)
+        event_volume = sample.get('event_volume', None)
+
+        # Check if the dataset is in training mode before applying transformations
+        if self.mode == 'train':
+            if event_volume is not None:
+                # print("Mode: train, Applying transformations")
+
+                # Random horizontal flip with a 50% probability
+                if torch.rand(1) < 0.5:
+                    event_volume = transforms.RandomHorizontalFlip(p=1.0)(event_volume)
+                    # print("Applied RandomHorizontalFlip")
+
+                # Random vertical flip with a 50% probability
+                if torch.rand(1) < 0.5:
+                    event_volume = transforms.RandomVerticalFlip(p=1.0)(event_volume)
+                    # print("Applied RandomVerticalFlip")
+
+                # Apply random rotation within a range of -15 to 15 degrees
+                event_volume = transforms.RandomRotation(degrees=(-15, 15))(event_volume)
+                # print("Applied RandomRotation within -15 to 15 degrees")
+
+                sample['event_volume'] = event_volume
+
+        else:
+            print(f"Mode: {self.mode}, Skipping transformations")
+
         return sample
 
     def get_voxel_grid(self, idx):
@@ -370,7 +402,7 @@ class Sequence(Dataset):
                 self.timestamps_flow[0] - self.delta_t_us, self.timestamps_flow[0])
         elif idx > 0 and idx <= self.__len__():
             event_data = self.event_slicer.get_events(
-                self.timestamps_flow[idx-1], self.timestamps_flow[idx-1] + self.delta_t_us)
+                self.timestamps_flow[idx - 1], self.timestamps_flow[idx - 1] + self.delta_t_us)
         else:
             raise IndexError
 
@@ -405,7 +437,7 @@ class Sequence(Dataset):
             y = event_data['y']
 
             t = (t - t[0]).astype('float32')
-            t = (t/t[-1])
+            t = (t / t[-1])
             x = x.astype('float32')
             y = y.astype('float32')
             pol = p.astype('float32')
@@ -420,8 +452,8 @@ class Sequence(Dataset):
             xy_rect = self.rectify_events(x.int(), y.int())
             x_rect = torch.from_numpy(xy_rect[:, 0]).long()
             y_rect = torch.from_numpy(xy_rect[:, 1]).long()
-            value = 2*event_data_torch['p']-1
-            index = self.width*y_rect + x_rect
+            value = 2 * event_data_torch['p'] - 1
+            index = self.width * y_rect + x_rect
             mask = (x_rect < self.width) & (y_rect < self.height)
             event_count[i].put_(index[mask], value[mask], accumulate=True)
 
@@ -441,7 +473,8 @@ class Sequence(Dataset):
 
 
 class SequenceRecurrent(Sequence):
-    def __init__(self, seq_path: Path, representation_type: RepresentationType, mode: str = 'test', delta_t_ms: int = 100,
+    def __init__(self, seq_path: Path, representation_type: RepresentationType, mode: str = 'test',
+                 delta_t_ms: int = 100,
                  num_bins: int = 15, transforms=None, sequence_length=1, name_idx=0, visualize=False, load_gt=False):
         super(SequenceRecurrent, self).__init__(seq_path, representation_type, mode, delta_t_ms, transforms=transforms,
                                                 name_idx=name_idx, visualize=visualize, load_gt=load_gt)
@@ -452,15 +485,15 @@ class SequenceRecurrent(Sequence):
     def get_continuous_sequences(self):
         continuous_seq_idcs = []
         if self.sequence_length > 1:
-            for i in range(len(self.timestamps_flow)-self.sequence_length+1):
+            for i in range(len(self.timestamps_flow) - self.sequence_length + 1):
                 diff = self.timestamps_flow[i +
-                                            self.sequence_length-1] - self.timestamps_flow[i]
-                if diff < np.max([100000 * (self.sequence_length-1) + 1000, 101000]):
+                                            self.sequence_length - 1] - self.timestamps_flow[i]
+                if diff < np.max([100000 * (self.sequence_length - 1) + 1000, 101000]):
                     continuous_seq_idcs.append(i)
         else:
-            for i in range(len(self.timestamps_flow)-1):
-                diff = self.timestamps_flow[i+1] - self.timestamps_flow[i]
-                if diff < np.max([100000 * (self.sequence_length-1) + 1000, 101000]):
+            for i in range(len(self.timestamps_flow) - 1):
+                diff = self.timestamps_flow[i + 1] - self.timestamps_flow[i]
+                if diff < np.max([100000 * (self.sequence_length - 1) + 1000, 101000]):
                     continuous_seq_idcs.append(i)
         return continuous_seq_idcs
 
@@ -490,17 +523,17 @@ class SequenceRecurrent(Sequence):
         if 'flipped' in sample.keys():
             flip = sample['flipped']
 
-        for i in range(self.sequence_length-1):
+        for i in range(self.sequence_length - 1):
             j += 1
             ts_old = ts_cur
             ts_cur = self.timestamps_flow[j]
-            assert(ts_cur-ts_old < 100000 + 1000)
+            assert (ts_cur - ts_old < 100000 + 1000)
             sample = self.get_data_sample(
                 j, crop_window=crop_window, flip=flip)
             sequence.append(sample)
 
         # Check if the current sample is the first sample of a continuous sequence
-        if idx == 0 or self.valid_indices[idx]-self.valid_indices[idx-1] != 1:
+        if idx == 0 or self.valid_indices[idx] - self.valid_indices[idx - 1] != 1:
             sequence[0]['new_sequence'] = 1
             print("Timestamp {} is the first one of the next seq!".format(
                 self.timestamps_flow[self.valid_indices[idx]]))
@@ -512,8 +545,8 @@ class SequenceRecurrent(Sequence):
             i, j, h, w = RandomCrop.get_params(
                 sample["event_volume_old"], output_size=self.crop_size)
             keys_to_crop = ["event_volume_old", "event_volume_new",
-                            "flow_gt_event_volume_old", "flow_gt_event_volume_new", 
-                            "flow_gt_next",]
+                            "flow_gt_event_volume_old", "flow_gt_event_volume_new",
+                            "flow_gt_next", ]
 
             for sample in sequence:
                 for key, value in sample.items():
@@ -528,7 +561,7 @@ class SequenceRecurrent(Sequence):
 
 class DatasetProvider:
     def __init__(self, dataset_path: Path, representation_type: RepresentationType, delta_t_ms: int = 100, num_bins=4,
-                config=None, visualize=False):
+                 config=None, visualize=False):
         test_path = Path(os.path.join(dataset_path, 'test'))
         train_path = Path(os.path.join(dataset_path, 'train'))
         assert dataset_path.is_dir(), str(dataset_path)
@@ -542,10 +575,9 @@ class DatasetProvider:
         for child in test_path.iterdir():
             self.name_mapper_test.append(str(child).split("/")[-1])
             test_sequences.append(Sequence(child, representation_type, 'test', delta_t_ms, num_bins,
-                                               transforms=[],
-                                               name_idx=len(
-                                                   self.name_mapper_test)-1,
-                                               visualize=visualize))
+                                           name_idx=len(
+                                               self.name_mapper_test) - 1,
+                                           visualize=visualize))
 
         self.test_dataset = torch.utils.data.ConcatDataset(test_sequences)
 
@@ -558,9 +590,10 @@ class DatasetProvider:
         for seq in seqs:
             extra_arg = dict()
             train_sequences.append(Sequence(Path(train_path) / seq,
-                                   representation_type=representation_type, mode="train",
-                                   load_gt=True, **extra_arg))
-            self.train_dataset: torch.utils.data.ConcatDataset[Sequence] = torch.utils.data.ConcatDataset(train_sequences)
+                                            representation_type=representation_type, mode="train",
+                                            load_gt=True, **extra_arg))
+            self.train_dataset: torch.utils.data.ConcatDataset[Sequence] = torch.utils.data.ConcatDataset(
+                train_sequences)
 
     def get_test_dataset(self):
         return self.test_dataset
@@ -579,6 +612,7 @@ class DatasetProvider:
             self.test_dataset.datasets[0].num_bins), True)
         logger.write_line("Number of Train Sequences: {}".format(
             len(self.train_dataset)), True)
+
 
 def train_collate(sample_list):
     batch = dict()
